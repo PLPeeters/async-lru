@@ -6,7 +6,7 @@ import sys
 import warnings
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine, Hashable
-from functools import _CacheInfo, _make_key, partial, partialmethod
+from functools import _CacheInfo, partial, partialmethod
 from typing import Any, Generic, Self, TypedDict, TypeVar, cast, final, overload
 
 
@@ -24,6 +24,46 @@ _R = TypeVar("_R")
 _Coro = Coroutine[Any, Any, _R]
 _CB = Callable[..., _Coro[_R]]
 _CBP = _CB[_R] | partial[_Coro[_R]] | partialmethod[_Coro[_R]]
+
+_KEYWORD_MARK = object()
+_FAST_KEY_TYPES = {int, str}
+
+
+class _HashedKey(list[Any]):
+    __slots__ = ("_hashvalue",)
+
+    def __init__(self, tup: tuple[Any, ...]) -> None:
+        self[:] = tup
+        self._hashvalue = hash(tup)
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        return self._hashvalue
+
+
+def _make_cache_key(
+    args: tuple[Any, ...], kwargs: dict[str, Any], typed: bool
+) -> Hashable:
+    if not kwargs and not typed:
+        if len(args) == 1 and type(args[0]) in _FAST_KEY_TYPES:
+            return cast(Hashable, args[0])
+        if sys.version_info >= (3, 14):
+            return args
+        return _HashedKey(args)
+
+    parts = list(args)
+    if kwargs:
+        parts.append(_KEYWORD_MARK)
+        for name, value in kwargs.items():
+            parts.extend((name, value))
+
+    if typed:
+        parts.extend(type(value) for value in args)
+        parts.extend(type(value) for value in kwargs.values())
+
+    key = tuple(parts)
+    if sys.version_info >= (3, 14):
+        return key
+    return _HashedKey(key)
 
 
 class AlruCacheLoopResetWarning(UserWarning):
@@ -172,14 +212,14 @@ class _LRUCacheWrapper(Generic[_R]):
         if self.__key is not None:
             key = self.__key(*args, **kwargs)
         else:
-            key = _make_key(args, kwargs, self.__typed)
+            key = _make_cache_key(args, kwargs, self.__typed)
         return key in self.__cache
 
     def cache_invalidate(self, /, *args: Hashable, **kwargs: Any) -> bool:
         if self.__key is not None:
             key = self.__key(*args, **kwargs)
         else:
-            key = _make_key(args, kwargs, self.__typed)
+            key = _make_cache_key(args, kwargs, self.__typed)
 
         cache_item = self.__cache.pop(key, None)
         if cache_item is None:
@@ -306,7 +346,7 @@ class _LRUCacheWrapper(Generic[_R]):
         if self.__key is not None:
             key = self.__key(*fn_args, **fn_kwargs)
         else:
-            key = _make_key(fn_args, fn_kwargs, self.__typed)
+            key = _make_cache_key(fn_args, fn_kwargs, self.__typed)
         cache_item = self.__cache.get(key)
         if cache_item is not None:
             self._cache_hit(key)

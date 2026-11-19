@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from collections.abc import Callable
 
 import pytest
@@ -76,6 +77,127 @@ async def test_typed_without_key_still_works() -> None:
 
     assert coro.cache_parameters()["typed"] is True
     assert await coro(1) == 1
+
+
+async def test_default_key_preserves_argument_form_and_keyword_order() -> None:
+    calls = 0
+
+    @alru_cache
+    async def coro(*args: object, **kwargs: object) -> int:
+        nonlocal calls
+        calls += 1
+        return calls
+
+    positional = await coro("value", 1)
+    keyword = await coro(value=1)
+    first_order = await coro(first=1, second=2)
+    reverse_order = await coro(second=2, first=1)
+
+    assert (positional, keyword, first_order, reverse_order) == (1, 2, 3, 4)
+    assert coro.cache_contains("value", 1)
+    assert coro.cache_contains(value=1)
+    assert coro.cache_contains(first=1, second=2)
+    assert coro.cache_contains(second=2, first=1)
+    assert coro.cache_invalidate("value", 1)
+    assert coro.cache_invalidate(value=1)
+    assert coro.cache_invalidate(first=1, second=2)
+    assert coro.cache_invalidate(second=2, first=1)
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected_calls"),
+    [(False, 2), (True, 3)],
+)
+async def test_default_key_preserves_typed_single_argument_behavior(
+    typed: bool, expected_calls: int
+) -> None:
+    calls = 0
+
+    @alru_cache(typed=typed)
+    async def coro(value: object) -> int:
+        nonlocal calls
+        calls += 1
+        return calls
+
+    integer = await coro(1)
+    float_value = await coro(1.0)
+    bool_value = await coro(True)
+    same_integer = await coro(1)
+
+    assert integer == same_integer
+    if typed:
+        assert float_value != bool_value
+    else:
+        assert float_value == bool_value
+    assert calls == expected_calls
+    assert coro.cache_contains(1)
+    assert coro.cache_contains(1.0)
+    assert coro.cache_contains(True)
+    assert coro.cache_invalidate(1)
+    assert coro.cache_invalidate(1.0)
+    assert coro.cache_invalidate(True) is typed
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected_calls"),
+    [(False, 1), (True, 2)],
+)
+async def test_default_key_preserves_typed_keyword_value_behavior(
+    typed: bool, expected_calls: int
+) -> None:
+    calls = 0
+
+    @alru_cache(typed=typed)
+    async def coro(**kwargs: object) -> int:
+        nonlocal calls
+        calls += 1
+        return calls
+
+    integer = await coro(value=1)
+    float_value = await coro(value=1.0)
+
+    if typed:
+        assert integer != float_value
+    else:
+        assert integer == float_value
+    assert calls == expected_calls
+    assert coro.cache_contains(value=1)
+    assert coro.cache_contains(value=1.0)
+    assert coro.cache_invalidate(value=1)
+    assert coro.cache_invalidate(value=1.0) is typed
+
+
+@pytest.mark.skipif(
+    sys.version_info >= (3, 14), reason="tuple hash caching compatibility"
+)
+@pytest.mark.parametrize("keyword", [False, True], ids=["positional", "keyword"])
+async def test_default_key_memoizes_hash_on_supported_legacy_runtimes(
+    keyword: bool,
+) -> None:
+    class HashCounter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __hash__(self) -> int:
+            self.calls += 1
+            return id(self)
+
+    @alru_cache
+    async def coro(value: HashCounter) -> None:
+        pass
+
+    value = HashCounter()
+    if keyword:
+        await coro(value=value)
+    else:
+        await coro(value)
+    assert value.calls == 1
+
+    if keyword:
+        await coro(value=value)
+    else:
+        await coro(value)
+    assert value.calls == 2
 
 
 async def test_key_on_method(check_lru: Callable[..., None]) -> None:
