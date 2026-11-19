@@ -83,3 +83,32 @@ async def test_cache_invalidate_multiple_args_different_order(
         ret = await coro(*args)
         assert ret == size
         check_lru(coro, hits=i + 1, misses=16, cache=8, tasks=0)
+
+
+async def test_invalidation_allows_replacement_while_old_call_finishes() -> None:
+    started = [asyncio.Event(), asyncio.Event()]
+    finish = [asyncio.Event(), asyncio.Event()]
+    calls = 0
+
+    @alru_cache(maxsize=1)
+    async def coro(val: int) -> int:
+        nonlocal calls
+        index = calls
+        calls += 1
+        started[index].set()
+        await finish[index].wait()
+        return index
+
+    old = asyncio.create_task(coro(1))
+    await started[0].wait()
+    assert coro.cache_invalidate(1)
+
+    replacement = asyncio.create_task(coro(1))
+    await started[1].wait()
+    finish[1].set()
+    assert await replacement == 1
+    finish[0].set()
+    assert await old == 0
+
+    assert await coro(1) == 1
+    assert calls == 2

@@ -1,7 +1,9 @@
 import asyncio
 import gc
 import sys
+import weakref
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -27,6 +29,51 @@ async def test_alru_exception(check_lru: Callable[..., None]) -> None:
         await coro(1)
 
     check_lru(coro, hits=2, misses=2, cache=0, tasks=0)
+
+
+async def test_evicted_exception_clears_inflight_entry(
+    check_lru: Callable[..., None]
+) -> None:
+    started = asyncio.Event()
+    fail = asyncio.Event()
+    inner_task_done = asyncio.Event()
+    calls = 0
+    inner_task_ref: weakref.ReferenceType[asyncio.Task[Any]] | None = None
+
+    @alru_cache(maxsize=1)
+    async def coro(val: int) -> int:
+        nonlocal calls, inner_task_ref
+        calls += 1
+        if val == 1 and calls == 1:
+            inner_task = asyncio.current_task()
+            assert inner_task is not None
+            inner_task_ref = weakref.ref(inner_task)
+            inner_task.add_done_callback(lambda _: inner_task_done.set())
+            started.set()
+            await fail.wait()
+            raise ValueError("failed")
+        return val
+
+    pending = asyncio.create_task(coro(1))
+    await started.wait()
+    assert await coro(2) == 2
+    check_lru(coro, hits=0, misses=2, cache=1, tasks=1, maxsize=1)
+
+    fail.set()
+    with pytest.raises(ValueError, match="failed") as error:
+        await pending
+    await inner_task_done.wait()
+    check_lru(coro, hits=0, misses=2, cache=1, tasks=0, maxsize=1)
+    error.value.__traceback__ = None
+    del error
+    del pending
+    gc.collect()
+    assert inner_task_ref is not None
+    assert inner_task_ref() is None
+
+    assert await coro(1) == 1
+    assert calls == 3
+    check_lru(coro, hits=0, misses=3, cache=1, tasks=0, maxsize=1)
 
 
 @pytest.mark.xfail(

@@ -1,4 +1,7 @@
 import asyncio
+import gc
+import weakref
+from typing import Any
 
 import pytest
 
@@ -56,3 +59,119 @@ async def test_cancel_single_waiter_triggers_handle_cancelled_error() -> None:
 
     # The underlying coroutine should be cancelled, so the flag should remain False
     assert cache_item_task_finished is False
+
+
+@pytest.mark.parametrize("evict", (False, True))
+async def test_cancel_one_waiter_preserves_shared_work(evict: bool) -> None:
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = 0
+
+    @alru_cache(maxsize=1)
+    async def coro(val: int) -> int:
+        nonlocal calls
+        calls += 1
+        if val == 1:
+            started.set()
+            try:
+                await finish.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        return val
+
+    first = asyncio.create_task(coro(1))
+    await started.wait()
+    if evict:
+        assert await coro(2) == 2
+    second = asyncio.create_task(coro(1))
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert not cancelled.is_set()
+    assert coro.cache_parameters()["tasks"] == 1
+
+    finish.set()
+    assert await second == 1
+    assert calls == (2 if evict else 1)
+    assert coro.cache_parameters()["tasks"] == 0
+
+
+@pytest.mark.parametrize("evict", (False, True))
+async def test_cancel_last_waiter_cancels_shared_work(evict: bool) -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    @alru_cache(maxsize=1)
+    async def coro(val: int) -> int:
+        if val == 1:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        return val
+
+    waiter = asyncio.create_task(coro(1))
+    await started.wait()
+    if evict:
+        assert await coro(2) == 2
+    assert coro.cache_parameters()["tasks"] == 1
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.sleep(0)
+    assert cancelled.is_set()
+    assert coro.cache_parameters()["tasks"] == 0
+
+
+@pytest.mark.parametrize("evict", (False, True))
+async def test_cancelled_computation_cannot_remove_replacement(evict: bool) -> None:
+    started = asyncio.Event()
+    cancellation_started = asyncio.Event()
+    finish_cancellation = asyncio.Event()
+    done_callback_ran = asyncio.Event()
+    old_task_ref: weakref.ReferenceType[asyncio.Task[Any]] | None = None
+    calls = 0
+
+    @alru_cache(maxsize=1)
+    async def coro(val: int) -> int:
+        nonlocal calls, old_task_ref
+        calls += 1
+        if val == 1 and calls == 1:
+            current_task = asyncio.current_task()
+            assert current_task is not None
+            old_task_ref = weakref.ref(current_task)
+            current_task.add_done_callback(lambda _: done_callback_ran.set())
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_started.set()
+                await finish_cancellation.wait()
+                raise
+        return val
+
+    first = asyncio.create_task(coro(1))
+    await started.wait()
+    if evict:
+        assert await coro(2) == 2
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await cancellation_started.wait()
+
+    assert await coro(1) == 1
+    assert coro.cache_parameters()["tasks"] == 1
+    finish_cancellation.set()
+    await done_callback_ran.wait()
+    gc.collect()
+    assert old_task_ref is not None
+    assert old_task_ref() is None
+    assert await coro(1) == 1
+    assert calls == (3 if evict else 2)
+    assert coro.cache_parameters()["tasks"] == 0

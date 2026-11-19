@@ -64,6 +64,8 @@ class _LRUCacheWrapper(Generic[_R]):
         "__jitter",
         "__key",
         "__cache",
+        "__pending",
+        "__inflight",
         "__closed",
         "__hits",
         "__misses",
@@ -128,6 +130,10 @@ class _LRUCacheWrapper(Generic[_R]):
         self.__jitter = jitter
         self.__key = key
         self.__cache: OrderedDict[Hashable, _CacheItem[_R]] = OrderedDict()
+        # Discoverable work outlives its result-cache entry when LRU eviction
+        # removes a pending computation.
+        self.__pending: dict[Hashable, _CacheItem[_R]] = {}
+        self.__inflight: set[asyncio.Task[_R]] = set()
         self.__closed = False
         self.__hits = 0
         self.__misses = 0
@@ -136,15 +142,7 @@ class _LRUCacheWrapper(Generic[_R]):
 
     @property
     def __tasks(self) -> list["asyncio.Task[_R]"]:
-        # NOTE: I don't think we need to form a set first here but not
-        # too sure we want it for guarantees
-        return list(
-            {
-                cache_item.task
-                for cache_item in self.__cache.values()
-                if not cache_item.task.done()
-            }
-        )
+        return [task for task in self.__inflight if not task.done()]
 
     def _check_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         if self.__first_loop is None:
@@ -188,6 +186,9 @@ class _LRUCacheWrapper(Generic[_R]):
             return False
         else:
             cache_item.cancel()
+            if self.__pending.get(key) is cache_item:
+                del self.__pending[key]
+            self.__inflight.discard(cache_item.task)
             return True
 
     def cache_clear(self) -> None:
@@ -198,6 +199,8 @@ class _LRUCacheWrapper(Generic[_R]):
             if c.later_call:
                 c.later_call.cancel()
         self.__cache.clear()
+        self.__pending.clear()
+        self.__inflight.clear()
 
     async def cache_close(self, *, wait: bool = False) -> None:
         self.__closed = True
@@ -236,16 +239,33 @@ class _LRUCacheWrapper(Generic[_R]):
     def _cache_miss(self, key: Hashable) -> None:
         self.__misses += 1
 
-    def _task_done_callback(self, key: Hashable, task: "asyncio.Task[_R]") -> None:
+    def _task_done_callback(
+        self, key: Hashable, task: "asyncio.Task[_R]"
+    ) -> None:
+        self.__inflight.discard(task)
+        pending_item = self.__pending.get(key)
+        cache_item: _CacheItem[_R] | None = None
+        if pending_item is not None and pending_item.task is task:
+            cache_item = pending_item
+            del self.__pending[key]
+        else:
+            cache_item = self.__cache.get(key)
+            if cache_item is not None and cache_item.task is not task:
+                cache_item = None
+
         # We must use the private attribute instead of `exception()`
         # so asyncio does not set `task.__log_traceback = False` on
         # the false assumption that the caller read the task Exception
         if task.cancelled() or task._exception is not None:
-            self.__cache.pop(key, None)
+            if cache_item is not None and self.__cache.get(key) is cache_item:
+                del self.__cache[key]
             return
 
-        cache_item = self.__cache.get(key)
-        if self.__ttl is not None and cache_item is not None:
+        if (
+            self.__ttl is not None
+            and cache_item is not None
+            and self.__cache.get(key) is cache_item
+        ):
             effective_ttl = self.__ttl
             if self.__jitter is not None:
                 effective_ttl += random.uniform(0, self.__jitter)
@@ -267,7 +287,10 @@ class _LRUCacheWrapper(Generic[_R]):
             if cache_item.waiters == 1 and not task.done():
                 cache_item.cancel()  # Cancel TTL expiration
                 task.cancel()  # Cancel the running coroutine
-                self.__cache.pop(key, None)  # Remove from cache
+                if self.__pending.get(key) is cache_item:
+                    del self.__pending[key]
+                if self.__cache.get(key) is cache_item:
+                    del self.__cache[key]
             raise
         finally:
             # Each logical waiter decrements waiters on exit (normal or cancelled).
@@ -285,7 +308,6 @@ class _LRUCacheWrapper(Generic[_R]):
         else:
             key = _make_key(fn_args, fn_kwargs, self.__typed)
         cache_item = self.__cache.get(key)
-
         if cache_item is not None:
             self._cache_hit(key)
             if not cache_item.task.done():
@@ -296,11 +318,21 @@ class _LRUCacheWrapper(Generic[_R]):
             # If the task is already done, just return the result.
             return cache_item.task.result()
 
+        cache_item = self.__pending.get(key)
+        if cache_item is not None:
+            if not cache_item.task.done():
+                self.__hits += 1
+                cache_item.waiters += 1
+                return await self._shield_and_handle_cancelled_error(cache_item, key)
+            if self.__pending.get(key) is cache_item:
+                del self.__pending[key]
+
         coro = self.__wrapped__(*fn_args, **fn_kwargs)
         task: asyncio.Task[_R] = loop.create_task(coro)
-        task.add_done_callback(partial(self._task_done_callback, key))
-
         cache_item = _CacheItem(task, None, 1)
+        task.add_done_callback(partial(self._task_done_callback, key))
+        self.__pending[key] = cache_item
+        self.__inflight.add(task)
         self.__cache[key] = cache_item
 
         if self.__maxsize is not None and len(self.__cache) > self.__maxsize:

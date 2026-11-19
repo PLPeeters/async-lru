@@ -197,3 +197,37 @@ def test_loop_change_warns_only_once() -> None:
         w for w in all_warnings if issubclass(w.category, AlruCacheLoopResetWarning)
     ]
     assert len(reset_warnings) == 1
+
+
+@pytest.mark.filterwarnings("ignore::async_lru.AlruCacheLoopResetWarning")
+def test_loop_change_drops_evicted_pending_computation() -> None:
+    started = asyncio.Event()
+    calls = 0
+
+    @alru_cache(maxsize=1)
+    async def cached_func(key: str) -> int:
+        nonlocal calls
+        calls += 1
+        if key == "pending" and calls == 1:
+            started.set()
+            await asyncio.Event().wait()
+        return calls
+
+    loop1 = asyncio.new_event_loop()
+    loop2 = asyncio.new_event_loop()
+    pending = loop1.create_task(cached_func("pending"))
+
+    async def cancel_pending() -> None:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+    try:
+        loop1.run_until_complete(started.wait())
+        assert loop1.run_until_complete(cached_func("other")) == 2
+        assert loop2.run_until_complete(cached_func("pending")) == 3
+    finally:
+        if not pending.done():
+            loop1.run_until_complete(cancel_pending())
+        loop1.close()
+        loop2.close()
+

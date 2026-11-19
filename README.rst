@@ -34,6 +34,15 @@ Usage
 
 This package is a port of Python's built-in `functools.lru_cache <https://docs.python.org/3/library/functools.html#functools.lru_cache>`_ function for `asyncio <https://docs.python.org/3/library/asyncio.html>`_. To better handle async behaviour, it also ensures multiple concurrent calls will only result in 1 call to the wrapped function, with all ``await``\s receiving the result of that call when it completes.
 
+The configured ``maxsize`` limits entries retained in the LRU cache.
+In-flight computations are tracked separately, so concurrent calls for the same
+arguments still share work if that key has been evicted from the result cache.
+This also applies with ``maxsize=0``: simultaneous calls are coalesced, while
+completed results are not retained. ``cache_info().currsize`` reports retained
+entries, including pending placeholders, and
+``cache_parameters()["tasks"]`` counts in-flight computations, including ones
+whose keys have been evicted.
+
 .. code-block:: python
 
     import asyncio
